@@ -1,0 +1,225 @@
+---
+title: "ALS MotorNeuron Proteomics Analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE, cache=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading Data
+
+The data set contains measurements from ALS and control groups, with 18 individual cells from each group (6 cells each from 3 donors per group). We also have a larger "boost" sample the consisted of a pool of ten single cells -- these data were used to facilitate a match-between-runs algorithm for increased assignment of peptide-spectrum-matches.
+
+```{r loading_data}
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(tidyverse)
+library(DEP)
+library(SummarizedExperiment)
+
+set.seed(2)
+
+setwd("~/Library/CloudStorage/OneDrive-Biogen/single cell proteomics/ALS_MotorNeurons")
+
+main.dir<-"/Users/stjhc/Library/CloudStorage/OneDrive-Biogen/single cell proteomics/ALS_MotorNeurons"
+
+samples<-read.csv(paste(main.dir, "/Sample_sheet.csv", sep=""))
+sc.pr<-read.csv(paste(main.dir,"/2022_01_13_nanoPOTS_SingleMN_ALS_Pilot_Dataset_for_JenHwa_and_Jake.csv", sep=""))
+sc.pr.norm<-sc.pr[,c(5,25,73:114)]
+colnames(sc.pr.norm)[3:44]<-samples$Sample
+
+```
+
+## Data Preparation
+
+Following the vignettes (<https://bioconductor.org/packages/devel/bioc/vignettes/DEP/inst/doc/DEP.html>), we created a SummarizedExperiment object.
+
+```{r data preparation}
+sc.pr.norm$Gene.Symbol %>% duplicated() %>% any()
+sc.pr.norm %>% group_by(Gene.Symbol) %>% summarize(frequency = n()) %>% 
+  arrange(desc(frequency)) %>% filter(frequency > 1)
+sc.pr.unique <- make_unique(sc.pr.norm, "Gene.Symbol", "Accession", delim = ";")
+
+
+label<-samples$Sample
+
+F_columns <- grep("F", colnames(sc.pr.unique))
+
+condition<-samples$Donor.Code
+replicate<-samples$replicate
+ExpDesign<-cbind(label, condition,replicate)
+ExpDesign<-data.frame(ExpDesign)
+
+boost<-which(samples$Randomizer=="Boost")
+F_columns <-F_columns[-boost]
+ExpDesign<-ExpDesign[-boost,]
+sc.pr.se <- make_se(sc.pr.unique, F_columns, ExpDesign)
+```
+
+## Filter on Missing Values
+
+We plot the frequency of missing values over samples. We filtered out the proteins that with 3 or more missing values in at least one condition. After filtering, 1,375 out of 2,752 proteins (50%) were removed from the anlysis. We also plotted the number of identified proteins per samples. Overall this data set contains a lot of missing values, with about 60% of the data missing. One sample (F22) has over 90% of the data missing and is removed from the analysis.
+
+```{r preprocessing}
+plot_frequency(sc.pr.se)
+sc.pr.filt <- filter_missval(sc.pr.se, thr = 3)
+plot_numbers(sc.pr.filt)
+plot_coverage(sc.pr.filt)
+
+colData(sc.pr.filt)$condition<-samples$Diagnosis[-boost]
+colData(sc.pr.filt)$replicate<-samples$Donor.Code[-boost]
+
+
+sc.pr.filt<-sc.pr.filt[,-which(colData(sc.pr.filt)$label=="F22")]
+```
+
+## Normalization
+
+The data is background corrected and normalized by variance stabilizing transformation (vsn). The distribution of all samples before and after normalization are shown here.
+
+Note: The variance stabilizing transformation method, which was developed for microarray data to remove the dependency of variance from the mean (heteroscedasticity), seems to work well for proteomic data too (See Välikangas et al, PMID: 27694351)
+
+```{r normalization}
+
+sc.pr.norm <- normalize_vsn(sc.pr.filt)
+plot_normalization(sc.pr.filt, sc.pr.norm)
+
+```
+
+# Imputation
+
+The missing data was imputed. First we inspected the pattern of missing data though a heatmap. We also compared intensity distributions and cumulative fraction of proteins with and without missing values.
+
+The data appears to MNAR (missing not at random). It appears that the proteins with missing values have on average low intensities. Therefore we imputed the data left-censored imputation methods (MinProb and man). The two methods appear to give similar results.
+
+```{r imputation}
+
+plot_missval(sc.pr.filt)
+plot_detect(sc.pr.filt)
+
+
+sc.pr.imp <- impute(sc.pr.filt, fun = "MinProb", q = 0.05)
+sc.pr.imp2 <- impute(sc.pr.filt, fun = "MinProb", q = 0.01)
+
+plot_imputation(sc.pr.filt, sc.pr.imp, sc.pr.imp2)
+
+```
+
+#Differential Expression
+
+We performed differential expression analysis on the imputed data. We applied a linear mixed model to account for the dependence structure among samples from the same donors (using *duplicateCorrelation()* function from limma). There were 493 differentially expressed proteins based on FDR adjusted p-value\<0.05 and log FC\>1.5. The PCA plot, correlation matrix, heatmap of the significant proteins and volcano plots are shown here.
+
+```{r DE}
+library(limma)
+
+se<-sc.pr.imp
+design_formula = formula(~0 + condition)
+control = "CTRL"
+
+col_data <- colData(se)
+raw <- assay(se)
+
+design <- model.matrix(design_formula, data = col_data)
+colnames(design) <- gsub("condition", "", colnames(design))
+conditions <- as.character(unique(col_data$condition))
+cntrst <- paste(conditions[!conditions %in% control], 
+                control, sep = " - ")
+
+corfit <- duplicateCorrelation(raw,design,block=col_data$replicate)
+
+fit <- lmFit(raw, design = design, block=col_data$replicate,correlation=corfit$consensus)
+made_contrasts <- makeContrasts(contrasts = cntrst, levels = design)
+contrast_fit <- contrasts.fit(fit, made_contrasts)
+
+eB_fit <- eBayes(contrast_fit)
+retrieve_fun <- function(comp, fit = eB_fit) {
+  res <- topTable(fit, sort.by = "t", coef = comp, number = Inf, 
+                  confint = TRUE)
+  res <- res[!is.na(res$t), ]
+  fdr_res <- fdrtool::fdrtool(res$t, plot = FALSE, verbose = FALSE)
+  res$qval <- fdr_res$qval
+  res$lfdr <- fdr_res$lfdr
+  res$comparison <- rep(comp, dim(res)[1])
+  res <- rownames_to_column(res)
+  return(res)
+}
+limma_res <- map_df(cntrst, retrieve_fun)
+table <- limma_res %>% select(rowname, logFC, CI.L, CI.R, P.Value, adj.P.Val, comparison) %>% 
+  mutate(comparison = gsub(" - ",  "_vs_", comparison)) %>% 
+  gather(variable, value, -c(rowname,comparison))  %>% 
+  mutate(variable = recode(variable, logFC = "diff", P.Value = "p.val", adj.P.Val = "p.adj"))  %>% 
+  unite(temp, comparison, variable) %>% spread(temp, value)
+
+rowData(se) <- merge(rowData(se, use.names = FALSE), table, 
+                     by.x = "name", by.y = "rowname", all.x = TRUE, sort = FALSE)
+
+sc.pr.diff<-se
+dep <- add_rejections(sc.pr.diff, alpha = 0.05, lfc = log2(1.5))
+plot_pca(dep, x = 1, y = 2, n = 500, point_size = 4)
+plot_cor(dep, significant = TRUE, lower = 0, upper = 1, pal = "Reds")
+plot_heatmap(dep, type = "centered", kmeans = TRUE, 
+             k = 6, col_limit = 4, show_row_names = FALSE,
+             indicate = c("condition", "replicate"))
+plot_volcano(dep, contrast = "ALS_vs_CTRL", label_size = 2, add_names = TRUE)
+
+
+```
+
+#Donor Information
+
+We repeated the differential expression analysis after adjusting for the donor infirmation, including age, sex and post mortem intervals (PMI, hours). After adjusting for donor information, only a small number of DE proteins remain.
+
+```{r donor}
+donor.info<-read.csv(paste(main.dir,"/2022_02_23_nanoPOTS_SingleMN_ALS_Pilot_Dataset_for_JenHwa_and_Jake_Donor_Potential_Covariates.csv", sep=""))
+
+colData(sc.pr.imp)$condition<-rep(c("ALS","CTL"), c(18,17))
+colData(sc.pr.imp)$replicate<-rep(c("ALS #1","ALS #2","ALS #3","CTL #1","CTL #2","CTL #3"), c(6,6,6,5,6,6))
+
+all.donor.info<-merge(colData(sc.pr.imp), donor.info, by.x="replicate", by.y="Donor_Code", all.x=TRUE, sort=FALSE)
+
+colData(sc.pr.imp)$PMI<-all.donor.info$PMI
+colData(sc.pr.imp)$Age<-all.donor.info$Age
+colData(sc.pr.imp)$Sex<-as.factor(all.donor.info$Sex)
+
+se<-sc.pr.imp
+design_formula = formula(~0 + condition + PMI + Age + Sex)
+control = "CTL"
+col_data <- colData(se)
+raw <- assay(se)
+
+design <- model.matrix(design_formula, data = col_data)
+colnames(design) <- gsub("condition", "", colnames(design))
+conditions <- as.character(unique(col_data$condition))
+cntrst <- paste(conditions[!conditions %in% control], 
+                control, sep = " - ")
+
+corfit <- duplicateCorrelation(raw,design,block=col_data$replicate)
+
+fit <- lmFit(raw, design = design, block=col_data$replicate,correlation=corfit$consensus)
+made_contrasts <- makeContrasts(contrasts = cntrst, levels = design)
+contrast_fit <- contrasts.fit(fit, made_contrasts)
+
+eB_fit <- eBayes(contrast_fit)
+
+limma_res <- map_df(cntrst, retrieve_fun)
+table <- limma_res %>% select(rowname, logFC, CI.L, CI.R, P.Value, adj.P.Val, comparison) %>% 
+  mutate(comparison = gsub(" - ",  "_vs_", comparison)) %>% 
+  gather(variable, value, -c(rowname,comparison))  %>% 
+  mutate(variable = recode(variable, logFC = "diff", P.Value = "p.val", adj.P.Val = "p.adj"))  %>% 
+  unite(temp, comparison, variable) %>% spread(temp, value)
+
+rowData(se) <- merge(rowData(se, use.names = FALSE), table, 
+                     by.x = "name", by.y = "rowname", all.x = TRUE, sort = FALSE)
+
+sc.pr.diff<-se
+dep <- add_rejections(sc.pr.diff, alpha = 0.05, lfc = log2(1.5))
+#plot_pca(dep, x = 1, y = 2, n = 500, point_size = 4)
+#plot_cor(dep, significant = TRUE, lower = 0, upper = 1, pal = "Reds")
+#plot_heatmap(dep, type = "centered", kmeans = TRUE, 
+#             k = 6, col_limit = 4, show_row_names = FALSE,
+#             indicate = c("condition", "replicate"))
+plot_volcano(dep, contrast = "ALS_vs_CTL", label_size = 2, add_names = TRUE)
+
+```
